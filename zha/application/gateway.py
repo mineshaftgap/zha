@@ -30,6 +30,7 @@ from zigpy.quirks.v2 import UNBUILT_QUIRK_BUILDERS
 from zigpy.state import State
 import zigpy.types as t
 from zigpy.types.named import EUI64
+from zigpy.zgp.events import DeviceLeft as _GPDeviceLeft
 
 from zha.application import discovery
 from zha.application.const import (
@@ -431,6 +432,26 @@ class Gateway(AsyncUtilMixin, EventBase):
         if device is None:
             return
         device.handle_gp_command(event)
+
+    async def _async_remove_gp_device(self, device: ZHAGPDevice) -> None:
+        """HA-UI delete path for GP devices.
+
+        GP devices are not in application_controller._devices, so the normal
+        async_remove_device path (which calls application_controller.remove)
+        would silently no-op.  Instead: remove from the GP manager, then emit
+        DeviceLeft - which triggers:
+          - appdb._on_gp_device_left  -> deletes gp_devices_v16 row (DB clean)
+          - gateway._gp_remove_event  -> pops _devices/_gp_by_source +
+                                         emits ZHA_GW_MSG_DEVICE_REMOVED
+        Two state stores exist but only the DB one survives restart:
+          1. gp_devices_v16 row     - cleared here via DeviceLeft
+          2. radio GP proxy table   - ages out / clears on radio power-cycle
+        """
+        source_id = device._gpd.source_id
+        gp = self.application_controller.green_power
+        gpd = gp.remove_device(source_id)
+        if gpd is not None:
+            gp.emit(_GPDeviceLeft.event_type, _GPDeviceLeft(device=gpd))
 
     # ------------------------------------------------------------------ end GP
 
@@ -929,6 +950,9 @@ class Gateway(AsyncUtilMixin, EventBase):
             return
         if device.is_active_coordinator:
             _LOGGER.info("Removing the active coordinator (%s) is not allowed", ieee)
+            return
+        if isinstance(device, ZHAGPDevice):
+            await self._async_remove_gp_device(device)
             return
         for group_id, group in self.groups.items():
             for member_ieee_endpoint_id in list(group.zigpy_group.members.keys()):

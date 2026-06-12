@@ -19,11 +19,12 @@ UI-delete acceptance criteria:
 from __future__ import annotations
 
 from collections.abc import Callable
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 from zigpy.quirks import _GP_REGISTRY, CustomGreenPowerDevice
 from zigpy.zgp.device import GPDevice as ZigpyGPDevice
+from zigpy.zgp.events import DeviceLeft
 from zigpy.zgp.types import SecurityKeyType, SecurityLevel
 
 from zha.application.const import ZHA_GW_MSG_DEVICE_FULL_INIT, ZHA_GW_MSG_DEVICE_REMOVED
@@ -366,3 +367,65 @@ class TestGpSetup:
         ctrl = MagicMock(spec=[])
         gw.application_controller = ctrl
         Gateway._gp_setup(gw)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# HA-UI delete path for GP devices
+# ---------------------------------------------------------------------------
+
+
+class TestGpUiDelete:
+    """async_remove_device on a GP IEEE uses the GP manager path."""
+
+    @pytest.mark.asyncio
+    async def test_calls_gp_remove_device(self):
+        """async_remove_device calls gp.remove_device(source_id) for a GP device."""
+        gw, gp_mock = _make_stub_gateway()
+        gpd = _make_zigpy_gpd()
+        Gateway._gp_add(gw, gpd)
+        assert gpd.ieee in gw._devices
+
+        gp_mock.remove_device = MagicMock(return_value=gpd)
+
+        await Gateway.async_remove_device(gw, gpd.ieee)
+
+        gp_mock.remove_device.assert_called_once_with(gpd.source_id)
+
+    @pytest.mark.asyncio
+    async def test_emits_device_left_on_gp_manager(self):
+        """DeviceLeft is emitted on the GP manager so DB row is deleted and gateway cleans up."""
+        gw, gp_mock = _make_stub_gateway()
+        gpd = _make_zigpy_gpd()
+        Gateway._gp_add(gw, gpd)
+
+        gp_mock.remove_device = MagicMock(return_value=gpd)
+
+        await Gateway.async_remove_device(gw, gpd.ieee)
+
+        gp_mock.emit.assert_called_once_with(DeviceLeft.event_type, ANY)
+        # Verify the payload device matches the zigpy GPD.
+        emitted_event = gp_mock.emit.call_args[0][1]
+        assert emitted_event.device is gpd
+
+    @pytest.mark.asyncio
+    async def test_application_controller_remove_not_called(self):
+        """application_controller.remove is NOT called for GP devices (they're not in app._devices)."""
+        gw, gp_mock = _make_stub_gateway()
+        gpd = _make_zigpy_gpd()
+        Gateway._gp_add(gw, gpd)
+
+        gp_mock.remove_device = MagicMock(return_value=gpd)
+
+        await Gateway.async_remove_device(gw, gpd.ieee)
+
+        gw.application_controller.remove.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_noop_for_unknown_ieee(self):
+        """async_remove_device is a no-op when the IEEE is not in _devices."""
+        gw, gp_mock = _make_stub_gateway()
+        gpd = _make_zigpy_gpd()
+
+        await Gateway.async_remove_device(gw, gpd.ieee)  # never added
+
+        gp_mock.remove_device.assert_not_called()
