@@ -56,6 +56,7 @@ from zha.async_ import (
 )
 from zha.event import EventBase
 from zha.zigbee.device import Device, DeviceInfo, DeviceStatus, ExtendedDeviceInfo
+from zha.zigbee.gp_device import GPDevice as ZHAGPDevice
 from zha.zigbee.group import Group, GroupInfo, GroupMemberReference
 
 BLOCK_LOG_TIMEOUT: Final[int] = 60
@@ -179,6 +180,7 @@ class Gateway(AsyncUtilMixin, EventBase):
         self.config: ZHAData = config
         self._devices: dict[EUI64, Device] = {}
         self._groups: dict[int, Group] = {}
+        self._gp_by_source: dict[int, ZHAGPDevice] = {}
         self.application_controller: ControllerApplication = None
         self.coordinator_zha_device: Device | None = None
 
@@ -260,6 +262,7 @@ class Gateway(AsyncUtilMixin, EventBase):
         )
 
         await self.load_devices()
+        self._gp_setup()
         self.load_groups()
 
         self.application_controller.add_listener(self)
@@ -334,6 +337,102 @@ class Gateway(AsyncUtilMixin, EventBase):
 
             for entity in discovery.discover_group_entities(zha_group):
                 entity.on_add()
+
+    # ------------------------------------------------------------------ GP wiring
+
+    def _gp_setup(self) -> None:
+        """Subscribe to GP manager events and rebuild persisted GPD wrappers.
+
+        Called once from ``_async_initialize`` after the zigpy app is up.  Uses
+        named-event subscriptions (``on_event``) rather than ``on_all_events``:
+        the GP events are frozen dataclasses whose discriminator attribute is
+        ``event_type`` (not ``.event``), which ``on_all_events`` cannot dispatch.
+        """
+        if not hasattr(self.application_controller, "green_power"):
+            return
+        gp = self.application_controller.green_power
+        gp.on_event("gp_device_joined", self._gp_add_event)
+        gp.on_event("gp_device_left", self._gp_remove_event)
+        gp.on_event("gp_command_received", self._gp_command_event)
+        for gpd in list(gp.devices.values()):
+            self._gp_add(gpd)
+
+    def _gp_add_event(self, event) -> None:
+        self._gp_add(event.device)
+
+    def _gp_remove_event(self, event) -> None:
+        self._gp_remove(event.device)
+
+    def _gp_command_event(self, event) -> None:
+        self._gp_command(event)
+
+    def _gp_add(self, gpd) -> None:
+        """Build a ZHA GPDevice wrapper and register it with the gateway."""
+        existing = gpd.ieee in self._devices
+        if existing:
+            device = self._devices[gpd.ieee]
+        else:
+            device = ZHAGPDevice.new(gpd, self)
+            if device._quirk is None:
+                _LOGGER.debug(
+                    "GP SrcID 0x%08x has no matching quirk - skipping", gpd.source_id
+                )
+                return
+            # Insert BEFORE emitting so ha-core's handle_device_fully_initialized
+            # can do get_device(event.device_info.ieee) and find it.
+            self._devices[gpd.ieee] = device
+            self._gp_by_source[gpd.source_id] = device
+        _LOGGER.debug(
+            "GP device %s: %s (SrcID 0x%08x)",
+            "re-joined" if existing else "added",
+            device.name,
+            gpd.source_id,
+        )
+        device_info = device.extended_device_info
+        # Mirror the normal device-join sequence: CONFIGURED (triggers entity
+        # creation + "Configuration complete") then INITIALIZED (unlocks the
+        # name/area dialog in the frontend).
+        self.emit(
+            ZHA_GW_MSG_DEVICE_FULL_INIT,
+            DeviceFullInitEvent(
+                device_info=ExtendedDeviceInfoWithPairingStatus(
+                    pairing_status=DevicePairingStatus.CONFIGURED,
+                    **device_info.__dict__,
+                ),
+                new_join=not existing,
+            ),
+        )
+        self.emit(
+            ZHA_GW_MSG_DEVICE_FULL_INIT,
+            DeviceFullInitEvent(
+                device_info=ExtendedDeviceInfoWithPairingStatus(
+                    pairing_status=DevicePairingStatus.INITIALIZED,
+                    **device_info.__dict__,
+                ),
+            ),
+        )
+
+    def _gp_remove(self, gpd) -> None:
+        """Remove a GPDevice from the gateway and notify ha-core."""
+        device = self._devices.pop(gpd.ieee, None)
+        self._gp_by_source.pop(gpd.source_id, None)
+        if device is not None:
+            _LOGGER.debug(
+                "GP device removed: %s (SrcID 0x%08x)", device.name, gpd.source_id
+            )
+            self.emit(
+                ZHA_GW_MSG_DEVICE_REMOVED,
+                DeviceRemovedEvent(device_info=device.extended_device_info),
+            )
+
+    def _gp_command(self, event) -> None:
+        """Route an incoming GP command to the matching GPDevice."""
+        device = self._gp_by_source.get(event.device.source_id)
+        if device is None:
+            return
+        device.handle_gp_command(event)
+
+    # ------------------------------------------------------------------ end GP
 
     @property
     def radio_concurrency(self) -> int:
